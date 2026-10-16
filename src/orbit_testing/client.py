@@ -18,9 +18,10 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
 
 from orbit.asgi import (
@@ -36,6 +37,7 @@ from orbit.asgi import (
 
 _MAX_TEST_RESPONSE_BYTES = 1024 * 1024 * 1024
 _MAX_TEST_RESPONSE_FRAMES = 1_000_000
+_METHOD_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,32}\Z")
 
 
 @dataclass(frozen=True)
@@ -78,10 +80,18 @@ class TestClient:
         self,
         application: ASGIApplication,
         *,
+        scheme: Literal["http", "https"] = "http",
         lifespan_timeout: float = 60,
         max_response_bytes: int = Response.MAX_BODY_BYTES,
         max_response_frames: int = 65_536,
     ) -> None:
+        """Configure the simulated ASGI scheme and bounded test-harness resources.
+
+        ``scheme="https"`` lets tests exercise TLS-gated application behavior. It only sets the
+        ASGI scope and does not create a TLS connection or verify transport configuration.
+        """
+        if scheme not in ("http", "https"):
+            raise ValueError("TestClient scheme must be either 'http' or 'https'.")
         if not _is_finite_number(lifespan_timeout) or lifespan_timeout <= 0:
             raise ValueError("lifespan_timeout must be finite and positive.")
         if (
@@ -97,6 +107,7 @@ class TestClient:
         ):
             raise ValueError("max_response_frames must be between 1 and 1,000,000.")
         self.application = application
+        self._scheme = scheme
         self._timeout = lifespan_timeout
         self._max_response_bytes = max_response_bytes
         self._max_response_frames = max_response_frames
@@ -172,14 +183,20 @@ class TestClient:
         """Send one complete buffered HTTP request and verify response framing."""
         if not self._active:
             raise RuntimeError("Send requests inside the TestClient context manager.")
-        if not isinstance(method, str) or not method:
-            raise TypeError("Request method must be a nonempty string.")
+        if not isinstance(method, str):
+            raise TypeError("Request method must be a string.")
+        if _METHOD_TOKEN.fullmatch(method) is None:
+            raise ValueError("Request method must be a valid HTTP token of at most 32 characters.")
         if not isinstance(path, str):
             raise TypeError("Request path must be a string.")
         if not isinstance(body, bytes):
             raise TypeError("Request body must be bytes.")
         url = urlsplit(path)
+        if url.scheme or url.netloc or url.fragment or not path.startswith("/"):
+            raise ValueError("Request path must be an origin-relative target without a fragment.")
         raw_path = url.path or "/"
+        if raw_path.startswith("//"):
+            raise ValueError("Request path must not begin with multiple slashes.")
         try:
             raw_path_bytes = raw_path.encode("utf-8")
             query_bytes = url.query.encode("utf-8")
@@ -200,7 +217,7 @@ class TestClient:
             if not isinstance(name, str) or not isinstance(value, str):
                 raise TypeError("Request header names and values must be strings.")
             try:
-                encoded_name = name.encode("latin-1")
+                encoded_name = name.lower().encode("ascii")
                 encoded_value = value.encode("latin-1")
             except UnicodeEncodeError as exc:
                 raise ValueError("Request headers must be Latin-1 encodable.") from exc
@@ -253,10 +270,11 @@ class TestClient:
                 "method": method.upper(),
                 "path": unquote(raw_path, encoding="utf-8", errors="strict"),
                 "raw_path": raw_path_bytes,
-                "scheme": url.scheme or "http",
+                "scheme": self._scheme,
                 "http_version": "1.1",
                 "root_path": "",
                 "client": ("127.0.0.1", 54321),
+                "server": ("testserver", 443 if self._scheme == "https" else 80),
                 "query_string": query_bytes,
                 "headers": wire_headers,
             },
@@ -269,7 +287,12 @@ class TestClient:
             raise AssertionError("ASGI response stream did not finish.")
         return TestResponse(
             response_start["status"],
-            Headers([(key.decode(), value.decode()) for key, value in response_start["headers"]]),
+            Headers(
+                [
+                    (key.decode("ascii"), value.decode("latin-1"))
+                    for key, value in response_start["headers"]
+                ]
+            ),
             bytes(response_body),
         )
 

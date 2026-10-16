@@ -1,56 +1,62 @@
-# Orbit Testing: operations and security
+# Orbit Testing operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
-
-## Configuration surface
-
-Environment names found in the package README:
-
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
-
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
-
-## Lifecycle, failure behavior, and limits
-
-`orbit-testing` provides an in-process client for testing Orbit applications through the real
-ASGI protocol, without opening sockets or installing another web framework.
-
-```bash
-pip install orbit-core orbit-testing
-```
+Use `TestClient` as an async context manager around each test scope:
 
 ```python
-from orbit import Application, ApplicationConfig
-from orbit.asgi import ASGIApplication, Response
-from orbit_testing import TestClient
-
-application = Application(ApplicationConfig(name="example"))
-
-
-@application.router.route("/", name="home")
-async def home(request):
-    return Response.text("hello")
-
-
-async def test_home():
-    async with TestClient(ASGIApplication(application)) as client:
-        response = await client.request("GET", "/")
-    assert response.status == 200
-    assert response.body == b"hello"
+async with TestClient(ASGIApplication(application)) as client:
+    response = await client.request("GET", "/health")
 ```
 
-The client sends ASGI lifespan startup and shutdown messages, bounds request path/query/header
-inputs using Core's public HTTP limits, preserves repeated response headers, and rejects malformed
-response framing. Captured responses default to a 16 MiB body limit and 65,536 frames; applications
-can lower or raise these within the hard 1 GiB and 1,000,000-frame bounds. Its requests are fully
-buffered and it models a client disconnect after the request body; it is not a browser, socket
-client, load generator, or substitute for host-level integration tests.
+The context drives application startup before yielding and shutdown before exiting. It surfaces
+lifespan failure acknowledgements and fails if the application exits without the protocol response.
+The default startup/shutdown wait is 60 seconds; lower it in focused tests that need fast failure.
+The client is single-use because application lifecycle state is single-use; construct a new client
+and application for a new test.
 
-## Status
+## Starting local infrastructure
 
-This package is pre-alpha; its API is not stable and it is not yet a published release. It supports
-Python 3.11 through 3.14.
+Use `ContainerService` as an async context manager around integration tests. Select a pinned image,
+container port, and only the environment variables that service needs:
 
-## Production validation
+```python
+service = ContainerService(
+    ContainerSpec("redis:7.4.2", 6379), engine="podman", startup_timeout=45
+)
+async with service as redis:
+    host, port = redis.endpoint.rsplit(":", 1)
+    ...
+```
 
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+The helper requires a working local Docker or Podman engine, publishes the port on `127.0.0.1`,
+checks TCP readiness, and stops its container on context exit. Startup, engine commands, and stop
+waits are bounded. If cleanup fails, call `close()` again; the service keeps the container handle
+for retry. A startup cancelled during container creation attempts to locate the resource by its
+unique label and remove it. Keep integration tests isolated and do not reuse a service instance
+after it has closed.
+
+Pin images by immutable version or digest. The test runner's access to the container engine is a
+privileged host capability. Run trusted images only; do not mount host paths or expose service ports
+outside loopback through custom engine configuration. The helper does not provision databases,
+brokers, cloud accounts, or test data.
+
+## Request and response capacity
+
+Requests are fully buffered and limited by Core's public HTTP path, query, and header bounds. The
+helper sends one `http.request` with `more_body=False`, then models disconnect. It lowercases header
+names, preserves repeats, validates method tokens, and rejects absolute URLs and fragments.
+
+Responses are fully buffered. Default limits are 16 MiB and 65,536 body frames, configurable from
+zero bytes/one frame up to 1 GiB/1,000,000 frames. Raise them only when the test intentionally
+covers large but finite output. The limit protects the test process; it is not an application
+response limit or streaming backpressure mechanism.
+
+## What requires host-level testing
+
+Use the real server/client stack to validate socket behavior, partial/chunked request bodies,
+streaming, long-lived connections, concurrency, TLS, proxies, forwarded identity, keep-alive,
+client abort timing, and deployment-level request limits. The in-process harness deliberately does
+not model those features or generate performance/load evidence.
+
+When a test fails during shutdown, inspect application lifespan cleanup rather than ignoring the
+exception. The client cancels a lifespan task that exceeds the configured timeout; applications
+that suppress cancellation can still delay test-process termination.

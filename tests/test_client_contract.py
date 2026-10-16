@@ -263,6 +263,73 @@ async def test_client_rejects_non_latin1_headers_explicitly():
             await client.request("GET", "/", headers={"x-test": "€"})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["https://example.test/resource", "/resource#fragment", "//other/resource"]
+)
+async def test_client_rejects_absolute_or_fragmented_request_targets(path: str) -> None:
+    app = Application(ApplicationConfig(name="invalid-request-target"))
+    async with TestClient(ASGIApplication(app)) as client:
+        with pytest.raises(ValueError, match="origin-relative"):
+            await client.request("GET", path)
+
+
+@pytest.mark.parametrize("scheme", ["", "ftp", "HTTPS", "https://example.test", None, True])
+def test_client_rejects_invalid_schemes(scheme: object) -> None:
+    app = Application(ApplicationConfig(name="invalid-scheme"))
+    with pytest.raises(ValueError, match="scheme must be either"):
+        TestClient(ASGIApplication(app), scheme=scheme)  # type: ignore[arg-type]
+
+
+async def test_client_sets_https_scheme_and_default_server_port() -> None:
+    observed: list[tuple[str, tuple[str, int]]] = []
+
+    class ScopeCapture:
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "lifespan":
+                startup = await receive()
+                await send({"type": f"lifespan.{startup['type'].split('.', 1)[1]}.complete"})
+                shutdown = await receive()
+                await send({"type": f"lifespan.{shutdown['type'].split('.', 1)[1]}.complete"})
+                return
+            observed.append((scope["scheme"], scope["server"]))
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    async with TestClient(ScopeCapture(), scheme="https") as client:
+        response = await client.request("GET", "/")
+
+    assert response.status == 200
+    assert observed == [("https", ("testserver", 443))]
+
+
+async def test_client_rejects_invalid_http_method_token() -> None:
+    app = Application(ApplicationConfig(name="invalid-method"))
+    async with TestClient(ASGIApplication(app)) as client:
+        with pytest.raises(ValueError, match="HTTP token"):
+            await client.request("GET\\r\\nInjected", "/")
+
+
+async def test_client_decodes_response_header_values_as_latin1() -> None:
+    class Latin1Response:
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "lifespan":
+                startup = await receive()
+                await send({"type": f"lifespan.{startup['type'].split('.', 1)[1]}.complete"})
+                shutdown = await receive()
+                await send({"type": f"lifespan.{shutdown['type'].split('.', 1)[1]}.complete"})
+                return
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": [(b"x-value", b"\xe9")]}
+            )
+            await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    async with TestClient(Latin1Response()) as client:
+        response = await client.request("GET", "/")
+
+    assert response.headers["x-value"] == "é"
+
+
 async def test_client_bounds_headers_before_building_the_asgi_scope() -> None:
     """The harness applies Core header limits before copying caller-owned input."""
     app = Application(ApplicationConfig(name="client-header-limits"))

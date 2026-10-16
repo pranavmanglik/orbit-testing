@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""In-process ASGI testing helpers for Orbit applications and integrations."""
+"""Testing helpers and opt-in local infrastructure for Orbit applications."""
 
 from orbit_testing.client import TestClient, TestResponse
+from orbit_testing.devservices import ContainerService, ContainerSpec, DevServiceError
 
-__all__ = ["TestClient", "TestResponse"]
+__all__ = ["ContainerService", "ContainerSpec", "DevServiceError", "TestClient", "TestResponse"]
